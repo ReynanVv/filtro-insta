@@ -39,6 +39,17 @@ def _normalize_detection(item: dict, frame_second: float | None = None) -> dict:
     return normalized
 
 
+def _detect(detector: NudeDetector, image) -> list[dict]:
+    # NudeNet v3 applies its own internal confidence threshold. We add a
+    # configurable post-filter so the API can tune sensitivity without forking
+    # the model implementation.
+    return [
+        item
+        for item in detector.detect(image)
+        if float(item.get("score", 0.0)) >= DETECTOR_SCORE_THRESHOLD
+    ]
+
+
 def _aggregate_policy(detections: list[dict]) -> PolicyResult:
     return evaluate_detections(detections)
 
@@ -46,7 +57,7 @@ def _aggregate_policy(detections: list[dict]) -> PolicyResult:
 def moderate_image(data: bytes) -> dict:
     started = time.perf_counter()
     detector = get_detector()
-    raw = detector.detect(data, score_threshold=DETECTOR_SCORE_THRESHOLD)
+    raw = _detect(detector, data)
     detections = [_normalize_detection(item) for item in raw]
     policy = _aggregate_policy(detections)
 
@@ -72,6 +83,7 @@ def moderate_video(data: bytes, suffix: str = ".mp4") -> dict:
         tmp.write(data)
         temp_path = tmp.name
 
+    capture = None
     try:
         capture = cv2.VideoCapture(temp_path)
         if not capture.isOpened():
@@ -95,7 +107,7 @@ def moderate_video(data: bytes, suffix: str = ".mp4") -> dict:
                 continue
 
             second = frame_index / fps
-            raw = detector.detect(frame, score_threshold=DETECTOR_SCORE_THRESHOLD)
+            raw = _detect(detector, frame)
             all_detections.extend(
                 _normalize_detection(item, frame_second=second) for item in raw
             )
@@ -106,9 +118,9 @@ def moderate_video(data: bytes, suffix: str = ".mp4") -> dict:
             policy_now = _aggregate_policy(all_detections)
             if policy_now.decision == "BLOCK" and policy_now.score >= 0.85:
                 break
-
-        capture.release()
     finally:
+        if capture is not None:
+            capture.release()
         Path(temp_path).unlink(missing_ok=True)
 
     policy = _aggregate_policy(all_detections)
