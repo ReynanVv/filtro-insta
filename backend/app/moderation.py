@@ -13,6 +13,7 @@ from .policy import PolicyResult, evaluate_detections
 
 _detector: NudeDetector | None = None
 _detector_lock = Lock()
+_inference_lock = Lock()
 
 SAMPLE_EVERY_SECONDS = float(os.getenv("SAMPLE_EVERY_SECONDS", "1.0"))
 MAX_VIDEO_SAMPLES = int(os.getenv("MAX_VIDEO_SAMPLES", "120"))
@@ -40,12 +41,14 @@ def _normalize_detection(item: dict, frame_second: float | None = None) -> dict:
 
 
 def _detect(detector: NudeDetector, image) -> list[dict]:
-    # NudeNet v3 applies its own internal confidence threshold. We add a
-    # configurable post-filter so the API can tune sensitivity without forking
-    # the model implementation.
+    # NudeNet v3 possui threshold interno. O filtro abaixo permite aumentar a
+    # sensibilidade mínima do nosso pipeline sem alterar o código do modelo.
+    with _inference_lock:
+        detections = detector.detect(image)
+
     return [
         item
-        for item in detector.detect(image)
+        for item in detections
         if float(item.get("score", 0.0)) >= DETECTOR_SCORE_THRESHOLD
     ]
 
@@ -90,20 +93,19 @@ def moderate_video(data: bytes, suffix: str = ".mp4") -> dict:
             raise ValueError("Não foi possível abrir o vídeo enviado.")
 
         fps = capture.get(cv2.CAP_PROP_FPS)
-        total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         if not fps or fps <= 0:
             fps = 30.0
 
         step = max(1, int(round(fps * SAMPLE_EVERY_SECONDS)))
-        frame_indexes = range(0, max(total_frames, 1), step)
+        frame_index = 0
 
-        for frame_index in frame_indexes:
-            if sampled_frames >= MAX_VIDEO_SAMPLES:
-                break
-
-            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        while sampled_frames < MAX_VIDEO_SAMPLES:
             ok, frame = capture.read()
             if not ok:
+                break
+
+            if frame_index % step != 0:
+                frame_index += 1
                 continue
 
             second = frame_index / fps
@@ -112,9 +114,9 @@ def moderate_video(data: bytes, suffix: str = ".mp4") -> dict:
                 _normalize_detection(item, frame_second=second) for item in raw
             )
             sampled_frames += 1
+            frame_index += 1
 
-            # Alta confiança de conteúdo explícito: não precisamos decodificar o
-            # restante inteiro do vídeo para impedir a publicação.
+            # Com alta confiança, encerramos cedo para reduzir latência.
             policy_now = _aggregate_policy(all_detections)
             if policy_now.decision == "BLOCK" and policy_now.score >= 0.85:
                 break
@@ -124,8 +126,6 @@ def moderate_video(data: bytes, suffix: str = ".mp4") -> dict:
         Path(temp_path).unlink(missing_ok=True)
 
     policy = _aggregate_policy(all_detections)
-
-    # Mantém o payload pequeno: retornamos primeiro as detecções mais confiáveis.
     all_detections.sort(key=lambda item: item["score"], reverse=True)
 
     return {
