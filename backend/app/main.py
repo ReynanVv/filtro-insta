@@ -5,6 +5,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from .moderation import moderate_image, moderate_video
 
@@ -37,12 +38,9 @@ def health() -> dict:
 async def moderate(file: UploadFile = File(...)) -> dict:
     content_type = (file.content_type or "").lower()
     if not (content_type.startswith("image/") or content_type.startswith("video/")):
-        raise HTTPException(
-            status_code=415,
-            detail="Envie uma imagem ou vídeo.",
-        )
+        raise HTTPException(status_code=415, detail="Envie uma imagem ou vídeo.")
 
-    data = await file.read()
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
     if not data:
         raise HTTPException(status_code=400, detail="Arquivo vazio.")
 
@@ -54,11 +52,11 @@ async def moderate(file: UploadFile = File(...)) -> dict:
 
     try:
         if content_type.startswith("image/"):
-            result = moderate_image(data)
+            result = await run_in_threadpool(moderate_image, data)
             media_type = "image"
         else:
             suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
-            result = moderate_video(data, suffix=suffix)
+            result = await run_in_threadpool(moderate_video, data, suffix)
             media_type = "video"
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
